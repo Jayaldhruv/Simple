@@ -108,4 +108,4 @@ hardest part at scale.
 
 ---
 
-*Built in 3 days. Designed to run in production.*
+*Built in 12 hours. Designed to run in production.*
