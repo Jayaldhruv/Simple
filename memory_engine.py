@@ -1,11 +1,24 @@
 """
 SIMP — Memory Engine
 Handles storage, retrieval, and AI reasoning over institutional decisions.
-Uses ChromaDB for vector search + Claude for synthesis.
+Uses ChromaDB for vector search + OpenRouter LLM for synthesis.
 """
 
+import os
+import requests
 import chromadb
 from chromadb.utils import embedding_functions
+
+# ── OpenRouter config ─────────────────────────────────────────────────────────
+# Get a free key at openrouter.ai → Dashboard → API Keys
+# Then: export OPENROUTER_API_KEY=your_key_here
+#
+# Free models that work well:
+#   "meta-llama/llama-3.1-8b-instruct:free"
+#   "mistralai/mistral-7b-instruct:free"
+#   "google/gemma-2-9b-it:free"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 
 
 SYNTHETIC_DECISIONS = [
@@ -235,7 +248,7 @@ class MemoryEngine:
                     metadatas=[{"domain": d["domain"], "outcome": d["outcome"]}]
                 )
             except Exception:
-                pass  # Already exists on re-run
+                pass
         self._loaded = True
 
     def count(self):
@@ -249,77 +262,131 @@ class MemoryEngine:
         ids = results["ids"][0] if results["ids"] else []
         return [self.decisions[i] for i in ids if i in self.decisions]
 
-    def reason(self, query: str, results: list) -> str:
+    def _call_openrouter(self, prompt: str) -> str:
         """
-        Local rule-based synthesis — no API key required.
-        Constructs a senior-colleague-style briefing from the retrieved decisions.
+        Calls OpenRouter API. Works exactly like OpenAI's API format.
+        Any model on openrouter.ai works here — just change OPENROUTER_MODEL.
         """
-        if not results:
-            return "No relevant history found in organizational memory. This appears to be genuinely new territory — proceed, but document your decisions as you go."
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://github.com/simp-wealthsimple",  # optional but good practice
+            },
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are SIMP — Wealthsimple's institutional memory system. You write like a senior colleague who has seen things go wrong before. Direct, concise, no fluff. Max 180 words."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": 300,
+                "temperature": 0.4,  # lower = more consistent, less creative
+            }
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
 
-        failed   = [r for r in results if r.get("outcome") in ["rejected", "failed", "abandoned"]]
-        shipped  = [r for r in results if r.get("outcome") in ["shipped", "adopted", "approved"]]
-        stale    = [r for r in results if r.get("assumptions_stale")]
+    def _rule_based_reason(self, results: list) -> str:
+        """
+        Fallback synthesis when no API key is set.
+        Constructs a briefing from the data directly using if-then logic.
+        """
+        failed  = [r for r in results if r.get("outcome") in ["rejected", "failed", "abandoned"]]
+        shipped = [r for r in results if r.get("outcome") in ["shipped", "adopted", "approved"]]
+        stale   = [r for r in results if r.get("assumptions_stale")]
+
         all_people = {}
         for r in results:
             for p in r.get("people", []):
                 all_people[p] = all_people.get(p, 0) + 1
-        top_people = sorted(all_people, key=all_people.get, reverse=True)[:3]
+        top_people = sorted(all_people, key=all_people.get, reverse=True)[:2]
 
         lines = []
 
-        # ── Most important thing ──────────────────────────────────────────────
         if failed:
             r = failed[0]
             lines.append(
                 f"⚠️ <b>Stop. This was attempted before.</b> '{r['title']}' ({r['date']}) "
-                f"ended as <b>{r['outcome']}</b>. "
-                f"{r.get('why_failed', 'Reason not fully documented.')} "
-                f"Do not assume the conditions have changed without verifying first."
+                f"ended as <b>{r['outcome']}</b>. {r.get('why_failed', 'Reason not fully documented.')} "
+                f"Do not assume conditions have changed without verifying first."
             )
         elif shipped:
             r = shipped[0]
             lines.append(
                 f"✅ <b>Related work shipped successfully.</b> '{r['title']}' ({r['date']}) "
-                f"gives you a foundation to build on. Review that decision before scoping anything new — "
-                f"you may be duplicating effort or can extend rather than rebuild."
+                f"gives you a foundation. Review it before scoping new work — you may be able to extend rather than rebuild."
             )
 
-        # ── Assumption most likely to burn them ───────────────────────────────
-        all_stale = []
-        for r in stale:
-            for a in r.get("assumptions_stale", []):
-                all_stale.append((a, r["title"]))
-
+        all_stale = [(a, r["title"]) for r in stale for a in r.get("assumptions_stale", [])]
         if all_stale:
             assumption, source = all_stale[0]
             lines.append(
-                f"🔍 <b>Assumption to verify before you go further:</b> \"{assumption}\" "
-                f"— this was flagged as potentially outdated based on '{source}'. "
-                f"If this assumption has shifted, your entire approach may need to change."
-            )
-        elif results[0].get("assumptions"):
-            assumption = results[0]["assumptions"][0]
-            lines.append(
-                f"🔍 <b>Watch this assumption:</b> past decisions in this space relied on \"{assumption}\". "
-                f"Verify it still holds before committing to a direction."
+                f"🔍 <b>Assumption to verify:</b> \"{assumption}\" — flagged as potentially outdated from '{source}'. "
+                f"If this has shifted, your approach may need to change entirely."
             )
 
-        # ── Who to talk to ────────────────────────────────────────────────────
         if top_people:
-            people_str = ", ".join(top_people[:2])
             lines.append(
-                f"👤 <b>Talk to these people first:</b> {people_str} — "
-                f"they appear across multiple related decisions and carry context that isn't in any document."
+                f"👤 <b>Talk to these people first:</b> {', '.join(top_people)} — "
+                f"they appear across multiple related decisions and carry context that isn't written down anywhere."
             )
 
-        # ── Compliance flag if relevant ───────────────────────────────────────
         compliance_keywords = ["kyc", "fintrac", "pipeda", "osfi", "regulatory", "compliance", "legal", "privacy"]
         compliance_hits = [r for r in results if any(k in " ".join(r.get("tags", [])) for k in compliance_keywords)]
         if compliance_hits:
             lines.append(
-                f"🚨 <b>Compliance touchpoint required.</b> {len(compliance_hits)} related decision(s) were blocked or altered by regulatory/legal review. "
-                f"Loop in Sarah Okonkwo (Compliance) or Ravi Nair (Legal) <i>before</i> prototyping, not after."
+                f"🚨 <b>Compliance touchpoint required.</b> {len(compliance_hits)} related decision(s) were blocked or altered by regulatory review. "
+                f"Loop in compliance <i>before</i> prototyping, not after."
             )
 
         return "<br><br>".join(lines)
+
+    def reason(self, query: str, results: list) -> str:
+        """
+        Main reasoning function.
+        Uses OpenRouter LLM if API key is set, otherwise falls back to rule-based synthesis.
+        """
+        if not results:
+            return "No relevant history found. This appears to be genuinely new territory — proceed, but document decisions as you go."
+
+        # ── Try OpenRouter first ──────────────────────────────────────────────
+        if OPENROUTER_API_KEY:
+            context_blocks = []
+            for r in results[:4]:
+                block = (
+                    f"Decision: {r['title']}\n"
+                    f"Date: {r['date']} | Outcome: {r['outcome']}\n"
+                    f"What happened: {r['what_happened']}\n"
+                    f"Why failed: {r.get('why_failed') or 'N/A'}\n"
+                    f"Stale assumptions: {', '.join(r.get('assumptions_stale', [])) or 'None flagged'}\n"
+                    f"People with context: {', '.join(r.get('people', []))}"
+                )
+                context_blocks.append(block)
+
+            prompt = (
+                f"A Wealthsimple team member has proposed:\n\"{query}\"\n\n"
+                f"Here is what the organization has already learned:\n\n"
+                + "\n---\n".join(context_blocks)
+                + "\n\nWrite a concise briefing (max 180 words) covering:\n"
+                "1. The single most important thing they need to know before proceeding\n"
+                "2. The assumption most likely to burn them if unchecked\n"
+                "3. Who they should talk to first\n\n"
+                "Be direct. No fluff. Write like a senior colleague who has seen this go wrong before. "
+                "Use plain text — no markdown, no bullet points, just short paragraphs."
+            )
+
+            try:
+                return self._call_openrouter(prompt)
+            except Exception as e:
+                # If API call fails for any reason, fall back gracefully
+                return self._rule_based_reason(results) + f"<br><br><small style='color:#6b7280'>Note: LLM synthesis unavailable ({str(e)[:60]}). Showing rule-based analysis.</small>"
+
+        # ── Fallback: rule-based ──────────────────────────────────────────────
+        return self._rule_based_reason(results)
