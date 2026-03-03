@@ -181,14 +181,26 @@ example_queries = [
     "Let's build a real-time spending insights feature for clients",
 ]
 
+# session_state persists values across Streamlit reruns triggered by button clicks
+if "query_text" not in st.session_state:
+    st.session_state.query_text = ""
+
 col_q, col_ex = st.columns([3, 1])
-with col_q:
-    query = st.text_area("", placeholder="e.g. 'We're thinking of rebuilding the onboarding flow to reduce friction...'", height=100, label_visibility="collapsed")
 with col_ex:
     st.markdown("<p style='color:#6b7280;font-size:0.8rem;margin-bottom:0.4rem'>Try an example:</p>", unsafe_allow_html=True)
     for ex in example_queries:
         if st.button(ex[:45] + "…", key=ex, use_container_width=True):
-            query = ex
+            st.session_state.query_text = ex
+            st.rerun()
+
+with col_q:
+    query = st.text_area(
+        "",
+        value=st.session_state.query_text,
+        placeholder="e.g. We're thinking of rebuilding the onboarding flow to reduce friction...",
+        height=100,
+        label_visibility="collapsed"
+    )
 
 use_ai = st.toggle("Enable synthesis layer", value=True)
 
